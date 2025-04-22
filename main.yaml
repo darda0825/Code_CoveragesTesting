@@ -1,0 +1,198 @@
+**********************************************
+
+name: Playwright Tests
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  schedule:
+    - cron: '30 13 * * 5'
+
+permissions:
+  contents: read
+  id-token: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  playwright-tests:
+    timeout-minutes: 100
+    runs-on: ubuntu-latest-4-core-internal
+    strategy:
+      fail-fast: false
+      matrix:
+        shardIndex: [1, 2, 3, 4, 5]
+        shardTotal: [5]
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: lmigtech/internal-actions/actions/setup-node@v0
+        with:
+          node-version: "20"
+
+      - name: Set npm registry
+        run: npm config set registry https://packages.lmig.com/api/npm/npm
+
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps
+
+      - name: Install Additional Dependencies (ffmpeg and xvfb)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg xvfb
+        shell: bash
+
+      - name: Start Xvfb (Virtual Display)
+        run: |
+          Xvfb :99 -screen 0 1920x1080x24 -ac -nolisten tcp &
+          sleep 3
+        shell: bash
+
+      - name: Run Playwright tests
+        run: DISPLAY=:99 npx playwright test --shard=${{ matrix.shardIndex }}/${{ matrix.shardTotal }} --reporter=html,json
+        working-directory: Playwright-Automation
+        continue-on-error: true
+
+      - name: check if blob report exists
+        run: ls -R Playwright-Automation || echo "Blob report directory not found"
+
+      - name: Upload blob report to GitHub Actions Artifacts
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: blob-report-${{ matrix.shardIndex }}
+          path: ./Playwright-Automation/blob-report
+          retention-days: 1
+
+      - name: Upload JSON result for pie chart
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: result-json-${{ matrix.shardIndex }}
+          path: ./Playwright-Automation/test-results/report.json
+          retention-days: 1
+
+  merge-reports:
+    name: Merge Shard Reports
+    if: ${{ !cancelled() }}
+    needs: [playwright-tests]
+    runs-on: ubuntu-latest-4-core-internal
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: lmigtech/internal-actions/actions/setup-node@v0
+        with:
+          node-version: "20"
+
+      - name: Install dependencies
+        run: npm install
+        working-directory: Playwright-Automation
+
+      - name: Download blob reports from GitHub Actions Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: all-blob-reports
+          pattern: blob-report-*
+          merge-multiple: true
+
+      - name: Download JSON results for pie chart
+        uses: actions/download-artifact@v4
+        with:
+          path: json-results
+          pattern: result-json-*
+          merge-multiple: true
+
+      - name: Merge into HTML Report
+        run: npx playwright merge-reports --reporter html ./all-blob-reports
+
+      - name: Generate pie chart HTML
+        run: node Playwright-Automation/scripts/generate-pie-chart.js
+        shell: bash
+
+      - name: Upload HTML report with pie chart
+        uses: actions/upload-artifact@v4
+        with:
+          name: html-report--attempt-${{ github.run_attempt }}
+          path: Playwright-Automation/html-report
+          retention-days: 7
+
+
+*******************************************************************************
+
+
+const fs = require('fs');
+const path = require('path');
+
+const jsonResultsDir = path.join(__dirname, '..', 'json-results');
+const reportHtmlFile = path.join(__dirname, '..', 'html-report', 'index.html');
+
+let passed = 0;
+let failed = 0;
+
+// Step 1: Read all JSON files and collect results
+const files = fs.readdirSync(jsonResultsDir);
+files.forEach(file => {
+  const fullPath = path.join(jsonResultsDir, file);
+  if (fs.statSync(fullPath).isFile() && file.endsWith('.json')) {
+    const data = JSON.parse(fs.readFileSync(fullPath, 'utf-8'));
+
+    if (Array.isArray(data.suites)) {
+      data.suites.forEach(suite => {
+        suite.specs?.forEach(spec => {
+          spec.tests?.forEach(test => {
+            test.results?.forEach(result => {
+              if (result.status === 'passed') passed++;
+              else if (result.status === 'failed') failed++;
+            });
+          });
+        });
+      });
+    }
+  }
+});
+
+// Step 2: Inject pie chart into index.html
+if (!fs.existsSync(reportHtmlFile)) {
+  console.error('HTML report not found!');
+  process.exit(1);
+}
+
+let html = fs.readFileSync(reportHtmlFile, 'utf-8');
+
+// Pie chart HTML block
+const chartBlock = `
+  <div style="width: 400px; margin: 20px auto;">
+    <h2 style="text-align:center;">Test Result Summary</h2>
+    <canvas id="resultPieChart" width="400" height="400"></canvas>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script>
+      const ctx = document.getElementById('resultPieChart').getContext('2d');
+      new Chart(ctx, {
+        type: 'pie',
+        data: {
+          labels: ['Passed', 'Failed'],
+          datasets: [{
+            label: 'Test Results',
+            data: [${passed}, ${failed}],
+            backgroundColor: ['#4CAF50', '#F44336'],
+          }]
+        },
+        options: {
+          responsive: true,
+          plugins: {
+            legend: { position: 'bottom' }
+          }
+        }
+      });
+    </script>
+  </div>
+`;
+
+// Step 3: Insert before closing </body>
+html = html.replace('</body>', `${chartBlock}\n</body>`);
+
+// Step 4: Save back
+fs.writeFileSync(reportHtmlFile, html, 'utf-8');
+console.log(`✅ Pie chart injected into report. Passed: ${passed}, Failed: ${failed}`);
