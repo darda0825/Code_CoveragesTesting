@@ -196,3 +196,128 @@ html = html.replace('</body>', `${chartBlock}\n</body>`);
 // Step 4: Save back
 fs.writeFileSync(reportHtmlFile, html, 'utf-8');
 console.log(`✅ Pie chart injected into report. Passed: ${passed}, Failed: ${failed}`);
+
+
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// same logic below as before...
+const jsonResultsDir = path.join(__dirname, '..', 'json-results');
+const reportHtmlFile = path.join(__dirname, '..', 'html-report', 'index.html');
+
+let passed = 0;
+let failed = 0;
+
+const files = fs.readdirSync(jsonResultsDir);
+files.forEach(file => {
+  const fullPath = path.join(jsonResultsDir, file);
+  if (fs.statSync(fullPath).isFile() && file.endsWith('.json')) {
+    const data = JSON.parse(fs.readFileSync(fullPath, 'utf-8'));
+
+    if (Array.isArray(data.suites)) {
+      data.suites.forEach(suite => {
+        suite.specs?.forEach(spec => {
+          spec.tests?.forEach(test => {
+            test.results?.forEach(result => {
+              if (result.status === 'passed') passed++;
+              else if (result.status === 'failed') failed++;
+            });
+          });
+        });
+      });
+    }
+  }
+});
+
+if (!fs.existsSync(reportHtmlFile)) {
+  console.error('HTML report not found!');
+  process.exit(1);
+}
+
+let html = fs.readFileSync(reportHtmlFile, 'utf-8');
+
+const chartBlock = `
+  <div style="width: 400px; margin: 20px auto;">
+    <h2 style="text-align:center;">Test Result Summary</h2>
+    <canvas id="resultPieChart" width="400" height="400"></canvas>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script>
+      const ctx = document.getElementById('resultPieChart').getContext('2d');
+      new Chart(ctx, {
+        type: 'pie',
+        data: {
+          labels: ['Passed', 'Failed'],
+          datasets: [{
+            label: 'Test Results',
+            data: [${passed}, ${failed}],
+            backgroundColor: ['#4CAF50', '#F44336'],
+          }]
+        },
+        options: {
+          responsive: true,
+          plugins: {
+            legend: { position: 'bottom' }
+          }
+        }
+      });
+    </script>
+  </div>
+`;
+
+html = html.replace('</body>', `${chartBlock}\n</body>`);
+fs.writeFileSync(reportHtmlFile, html, 'utf-8');
+console.log(`✅ Pie chart injected into report. Passed: ${passed}, Failed: ${failed}`);
+
+
+
+*******************************************
+
+merge-reports:
+  name: Merge Shard Reports
+  if: ${{ !cancelled() }}
+  needs: [playwright-tests]
+  runs-on: ubuntu-latest-4-core-internal
+
+  steps:
+    - uses: actions/checkout@v4
+    - uses: lmigtech/internal-actions/actions/setup-node@v0
+      with:
+        node-version: "20"
+
+    - name: Install dependencies
+      run: npm install
+      working-directory: Playwright-Automation
+
+    - name: Download blob reports from GitHub Actions Artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: all-blob-reports
+        pattern: blob-report-*
+        merge-multiple: true
+
+    - name: Download JSON results for pie chart
+      uses: actions/download-artifact@v4
+      with:
+        path: json-results
+        pattern: result-json-*
+        merge-multiple: true
+
+    - name: Merge into HTML Report
+      run: npx playwright merge-reports --reporter html ./all-blob-reports
+
+    # 🔽 ADD THIS STEP HERE
+    - name: Generate pie chart HTML
+      run: node Playwright-Automation/scripts/generate-pie-chart.mjs
+      shell: bash
+
+    - name: Upload HTML report with pie chart
+      uses: actions/upload-artifact@v4
+      with:
+        name: html-report--attempt-${{ github.run_attempt }}
+        path: Playwright-Automation/html-report
+        retention-days: 7
+
